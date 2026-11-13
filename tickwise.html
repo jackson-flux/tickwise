@@ -159,6 +159,13 @@ canvas { width: 100%; height: 160px; display: block; }
       </div>
       <select id="target" aria-label="Target rate"></select>
     </div>
+    <div class="field" id="customRow" hidden>
+      <label class="label" for="customBph">Target in beats per hour</label>
+      <div class="row">
+        <input id="customBph" type="number" step="1" min="1000" max="72000" value="10000" inputmode="decimal">
+        <span class="sub" id="customHint"></span>
+      </div>
+    </div>
 
     <div class="hero">
       <div class="tile">
@@ -251,7 +258,7 @@ canvas { width: 100%; height: 160px; display: block; }
 (function (root) {
   'use strict';
 
-  var STANDARD_BPH = [3600, 7200, 9000, 10800, 14400, 16200, 18000, 19800, 21600, 25200, 28800, 36000];
+  var STANDARD_BPH = [3600, 7200, 9000, 10800, 12600, 14400, 16200, 18000, 19800, 21600, 25200, 28800, 36000];
 
   function median(a) {
     var s = a.slice().sort(function (x, y) { return x - y; });
@@ -754,7 +761,7 @@ canvas { width: 100%; height: 160px; display: block; }
   var S = {
     mode: 'demo', sr: 48000, samples: null, det: null, label: '',
     win: 30, ppm: 0, sens: 8, hp: 2000, refBph: 3600, target: 'auto',
-    hist: [], result: null, live: null, timer: null, liveEvery: 200, liveHistT: -1, demoMeta: null
+    hist: [], result: null, live: null, timer: null, liveEvery: 200, customBph: 10000, liveHistT: -1, demoMeta: null
   };
 
   /* ---------- small helpers ---------- */
@@ -776,20 +783,30 @@ canvas { width: 100%; height: 160px; display: block; }
       if (typeof j.hp === 'number') S.hp = j.hp;
       if (typeof j.win === 'number') S.win = j.win;
       if (typeof j.refBph === 'number') S.refBph = j.refBph;
+      if (typeof j.customBph === 'number' && j.customBph > 0) S.customBph = j.customBph;
     } catch (e) { /* storage unavailable */ }
   }
   function save() {
-    try { localStorage.setItem('tickwise', JSON.stringify({ v: 2, ppm: S.ppm, sens: S.sens, hp: S.hp, win: S.win, refBph: S.refBph })); } catch (e) { /* ignore */ }
+    try { localStorage.setItem('tickwise', JSON.stringify({ v: 2, customBph: S.customBph, ppm: S.ppm, sens: S.sens, hp: S.hp, win: S.win, refBph: S.refBph })); } catch (e) { /* ignore */ }
   }
 
   /* ---------- analysis and readout ---------- */
   function pickBph(res) {
+    if (S.target === 'custom') return S.customBph > 0 ? S.customBph : null;
     if (S.target !== 'auto') return +S.target;
     if (!res || !res.ok) return null;
-    return TG.snapBph(res.T).bph;
+    var sn = TG.snapBph(res.T);
+    return Math.abs(sn.offset) <= 0.03 ? sn.bph : null;   // a standard more than 3% away is not a match
   }
 
-  function setTargetText(bph) {
+  function setTargetText(bph, res) {
+    if (!bph) {
+      $('tgtHz').textContent = '\u2013';
+      $('tgtSub').textContent = res && res.ok
+        ? 'No standard rate within 3% of the measured ' + fmtInt(3600 / res.T) + ' bph. Choose Custom and enter the rate for this clock.'
+        : 'Waiting for a measurement';
+      return;
+    }
     $('tgtHz').textContent = hzText(bph);
     $('tgtSub').textContent = fmtInt(bph) + ' bph, ' + (7.2e6 / bph).toFixed(3) + ' ms period' + (S.target === 'auto' ? ', detected' : ', set by you');
   }
@@ -807,7 +824,7 @@ canvas { width: 100%; height: 160px; display: block; }
     if (S.mode === 'live') msg = 'Listening for ticks. Hold the microphone close to the clock.';
     else msg = 'Fewer than 6 ticks were found. Record closer to the clock, or lower the threshold in settings.';
     clearReadout('No reading', msg);
-    var bph = S.target !== 'auto' ? +S.target : null;
+    var bph = S.target === 'auto' ? null : pickBph(res);
     if (bph) setTargetText(bph);
     $('nticks').textContent = res.n ? String(res.n) : '–';
   }
@@ -816,10 +833,21 @@ canvas { width: 100%; height: 160px; display: block; }
 
   function showResult(res) {
     var bph = pickBph(res);
-    setTargetText(bph);
+    setTargetText(bph, res);
     var periodMs = res.T * 2000, freq = 1 / (2 * res.T), bphMeas = 3600 / res.T;
     $('period').innerHTML = periodMs.toFixed(3) + '<small>ms</small>';
     $('freq').textContent = freq.toFixed(5) + ' Hz, ' + bphMeas.toFixed(1) + ' bph';
+    if (!bph) {
+      $('rate').textContent = '\u2013';
+      var rc0 = $('rateCi'); rc0.innerHTML = '&nbsp;'; rc0.dataset.conf = '';
+      var p0 = $('pill'); p0.textContent = 'Needs a target'; p0.dataset.state = 'none';
+      $('advice').textContent = 'This clock beats at ' + bphMeas.toFixed(0) + ' bph (' + freq.toFixed(3) + ' Hz), which is not close to a standard rate, so I cannot say how many seconds a day it gains or loses. Choose Custom in the target menu and enter the rate it is meant to run at.';
+      $('beat').textContent = res.beatErr == null ? '\u2013' : (res.beatErr * 1000).toFixed(2) + ' ms';
+      $('nticks').textContent = res.n + ' of ' + res.nRaw;
+      $('jit').textContent = Math.round(res.sigma * 1e6) + ' \u00b5s';
+      $('unc').textContent = '\u2013';
+      return;
+    }
     var rate = rateOf(res.T, bph), ci = res.ciSday, ciTxt = fmtCi(ci);
     $('rate').innerHTML = signed(rate, 1) + '<small>s/day</small>';
     var rc = $('rateCi');
@@ -942,8 +970,8 @@ canvas { width: 100%; height: 160px; display: block; }
 
   function drawTrace(res, bph) {
     var c = prep($('cTrace')), col = colors();
-    if (!res || !res.ok || !bph) { emptyMsg(c, col, 'The trace appears once ticks are measured'); return; }
-    var Tt = 3600 / bph, t0 = res.ts[0], xs = [], ys = [], i, ymin = Infinity, ymax = -Infinity;
+    if (!res || !res.ok) { emptyMsg(c, col, 'The trace appears once ticks are measured'); return; }
+    var Tt = bph ? 3600 / bph : res.T, t0 = res.ts[0], xs = [], ys = [], i, ymin = Infinity, ymax = -Infinity;
     for (i = 0; i < res.ts.length; i++) {
       xs.push(res.ts[i] - t0); ys.push((res.ts[i] - t0 - res.ks[i] * Tt) * 1000);
     }
@@ -1173,6 +1201,8 @@ canvas { width: 100%; height: 160px; display: block; }
       var op = document.createElement('option');
       op.value = String(b); op.textContent = fmtInt(b) + ' bph (' + (b / 7200) + ' Hz)'; sel.appendChild(op);
     });
+    var oc = document.createElement('option'); oc.value = 'custom'; oc.textContent = 'Custom...'; sel.appendChild(oc);
+    $('customBph').value = S.customBph;
     $('sens').value = S.sens; $('sensVal').textContent = S.sens;
     $('hp').value = String(S.hp); $('win').value = String(S.win);
     $('ppm').value = S.ppm; $('refBph').value = S.refBph;
@@ -1181,7 +1211,16 @@ canvas { width: 100%; height: 160px; display: block; }
     $('rerunDemo').addEventListener('click', function () { runDemo(false); });
     $('file').addEventListener('change', function (e) { handleFile(e.target.files && e.target.files[0]); e.target.value = ''; });
     $('liveBtn').addEventListener('click', startLive);
-    sel.addEventListener('change', function () { S.target = sel.value; rerender(); if (S.live) render(); });
+    function customHint() {
+      var b = S.customBph;
+      $('customHint').textContent = b > 0 ? (b / 7200).toFixed(3) + ' Hz, ' + (7.2e6 / b).toFixed(2) + ' ms period' : '';
+    }
+    sel.addEventListener('change', function () {
+      S.target = sel.value; $('customRow').hidden = S.target !== 'custom'; customHint(); rerender(); if (S.live) render();
+    });
+    $('customBph').addEventListener('input', function (e) {
+      var v = parseFloat(e.target.value); S.customBph = isFinite(v) && v >= 1000 && v <= 72000 ? v : 0; save(); customHint(); rerender(); if (S.live) render();
+    });
     $('sens').addEventListener('input', function (e) { S.sens = +e.target.value; $('sensVal').textContent = S.sens; save(); reprocessSoon(); });
     $('hp').addEventListener('change', function (e) { S.hp = +e.target.value; save(); reprocessSoon(); });
     $('win').addEventListener('change', function (e) { S.win = +e.target.value; save(); rerender(); });
