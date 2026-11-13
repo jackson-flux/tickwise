@@ -276,33 +276,62 @@ canvas { width: 100%; height: 160px; display: block; }
     setHp(o.hpHz);
 
     var aEnv = 1 - Math.exp(-1 / (o.tauEnv * sr));
-    var aNf = 1 / (0.5 * sr);
     var FLOOR = 1e-4;
-    var H = 1024, mask = H - 1, hist = new Float32Array(H);
+
+    // Background level = running median of the envelope over about 3 s, kept in a log-spaced histogram.
+    // Ticks fill well under half of the time, so they cannot drag the median up, and it recovers by itself
+    // from digital silence at the start of a recording.
+    var NB = 96, LMIN = Math.log(1e-6), LMAX = Math.log(2), BW = (LMAX - LMIN) / NB;
+    var nfH = new Float64Array(NB), nfDecay = 1 - 1 / 3000;
+    function updateNf(e) {
+      var b = Math.floor((Math.log(e < 1e-6 ? 1e-6 : e) - LMIN) / BW), i, tot = 0;
+      if (b < 0) b = 0; else if (b >= NB) b = NB - 1;
+      for (i = 0; i < NB; i++) { nfH[i] *= nfDecay; tot += nfH[i]; }
+      nfH[b] += 1; tot += 1;
+      var half = tot / 2, acc = 0;
+      for (i = 0; i < NB; i++) {
+        if (acc + nfH[i] >= half) { nf = Math.exp(LMIN + (i + (half - acc) / nfH[i]) * BW); return; }
+        acc += nfH[i];
+      }
+    }
+    var H = 16384, mask = H - 1, hist = new Float32Array(H);
     var D = Math.max(1, Math.round(sr / 1000)), VN = 2000;
     var vis = new Float32Array(VN), visW = 0, blockMax = 0, blockN = 0;
     var peakN = Math.round(o.peakWin * sr), warmN = Math.round(o.warm * sr);
 
     var T = [], A = [];
     var x1 = 0, x2 = 0, y1 = 0, y2 = 0, env = 0, prevEnv = 0;
-    var n = 0, nf = 0, warmSum = 0, thr = FLOOR;
-    var state = 0, cN = 0, pk = 0, pkN = 0, lastT = -1, refr = 0.06;
+    var n = 0, nf = 1e-6, firstSig = -1, thr = FLOOR, warmSig = Math.round(0.4 * sr);
+    var state = 0, cN = 0, pk = 0, lastT = -1, refr = 0.06, medIv = 0;
 
     function updateRefr() {
       if (T.length < 9) return;
       var iv = [];
       for (var i = T.length - 16; i < T.length; i++) if (i > 0) iv.push(T[i] - T[i - 1]);
       var m = median(iv);
+      medIv = m;
       refr = Math.min(0.45, Math.max(0.03, 0.4 * m));
     }
 
+    /* A tick is often a short chain of sounds (unlocking, impulse, locking), so one threshold crossing is not
+       one tick. After the first crossing, wait out a cluster window, find the loudest sound in it, and time the
+       first sound that reaches half of that loudest level. */
+    function clusterLen() {
+      var w = medIv > 0 ? Math.min(0.06, Math.max(0.012, 0.25 * medIv)) : 0.05;
+      return Math.round(w * sr);
+    }
+
     function finish() {
-      var level = o.cf * pk, j = pkN;
-      while (n - j < H - 2 && hist[j & mask] > level) j--;
-      var v0 = hist[j & mask], v1 = hist[(j + 1) & mask], den = v1 - v0;
+      var half = 0.5 * pk, j = cN;
+      while (j < n && hist[j & mask] <= half) j++;
+      var pj = j, pv = hist[j & mask], e = Math.min(n, j + peakN), q;
+      for (q = j; q <= e; q++) { var v = hist[q & mask]; if (v > pv) { pv = v; pj = q; } }
+      var level = o.cf * pv, jj = pj, lim = Math.max(cN - 1, j - peakN);
+      while (jj > lim && hist[jj & mask] > level) jj--;
+      var v0 = hist[jj & mask], v1 = hist[(jj + 1) & mask], den = v1 - v0;
       var frac = den > 0 ? (level - v0) / den : 1;
       if (frac < 0) frac = 0; else if (frac > 1) frac = 1;
-      var t = (j + frac) / sr;
+      var t = (jj + frac) / sr;
       T.push(t); A.push(pk);
       lastT = t; state = 0;
       updateRefr();
@@ -316,18 +345,18 @@ canvas { width: 100%; height: 160px; display: block; }
         env += aEnv * ((y < 0 ? -y : y) - env);
         hist[n & mask] = env;
         if (env > blockMax) blockMax = env;
-        if (++blockN >= D) { vis[visW % VN] = blockMax; visW++; blockMax = 0; blockN = 0; }
+        if (++blockN >= D) { vis[visW % VN] = blockMax; visW++; blockMax = 0; blockN = 0; updateNf(env); }
 
-        if (n < warmN) {
-          warmSum += env; nf = warmSum / (n + 1);
+        if (firstSig < 0 && env > FLOOR) firstSig = n;
+        if (n < warmN || firstSig < 0 || n < firstSig + warmSig) {
+          /* settling: no detection until the background level is known */
         } else {
           thr = nf * o.sens; if (thr < FLOOR) thr = FLOOR;
           if (state === 0) {
-            if (env < 3 * nf) nf += aNf * (env - nf);
-            if (env > thr && prevEnv <= thr && n / sr - lastT > refr) { state = 1; cN = n; pk = env; pkN = n; }
+            if (env > thr && prevEnv <= thr && n / sr - lastT > refr) { state = 1; cN = n; pk = env; }
           } else {
-            if (env > pk) { pk = env; pkN = n; }
-            if (n - cN >= peakN) finish();
+            if (env > pk) pk = env;
+            if (n - cN >= clusterLen()) finish();
           }
         }
         prevEnv = env;
@@ -483,6 +512,16 @@ canvas { width: 100%; height: 160px; display: block; }
     var sigma = Math.max(Math.sqrt(ssr / Math.max(1, ninl - m)), 20e-6);
     var frac = ninl / n;
     var seT = (sigma / Math.sqrt(Math.max(frac, 0.25))) * Math.sqrt(f.inv[1][1]);
+    // Mechanical timing drifts slowly (amplitude changes shift every tick the same way), so neighbouring
+    // residuals are correlated and the plain formula is too optimistic. Widen by the usual AR(1) factor,
+    // but only when the correlation is clearly more than chance.
+    var num = 0, den = 0, np = 0;
+    for (i = 0; i < n; i++) {
+      if (w[i] > 0) den += f.res[i] * f.res[i];
+      if (i + 1 < n && w[i] > 0 && w[i + 1] > 0 && ks[i + 1] - ks[i] === 1) { num += f.res[i] * f.res[i + 1]; np++; }
+    }
+    var rho = (np >= 8 && den > 0) ? (num / np) / (den / ninl) : 0;
+    if (rho > 2 / Math.sqrt(np || 1)) { var rr = Math.min(rho, 0.9); seT *= Math.sqrt((1 + rr) / (1 - rr)); }
     // Fixed-width fit quality, so a wrong beat guess with a huge scatter cannot win on inlier count alone
     var score = 0, tau = 0.03 * f.T;
     for (i = 0; i < n; i++) score += tukey(f.res[i] / tau);
@@ -809,12 +848,13 @@ canvas { width: 100%; height: 160px; display: block; }
       advice.appendChild(n);
     }
     if (res.confidence !== 'high') {
-      var why = [];
-      if (res.n < 0.6 * res.nRaw) why.push('many sounds are being treated as strays');
-      if (res.sigma > 0.001) why.push('tick timing is scattered');
-      if (res.n < 40) why.push('only ' + res.n + ' usable ticks so far');
+      var why = [], tips = [], spanS = res.ts[res.ts.length - 1] - res.ts[0];
+      if (res.n < 0.6 * res.nRaw) { why.push('many sounds are being treated as strays'); tips.push('Move the microphone closer or raise the threshold in settings.'); }
+      if (spanS < 60) { why.push('only ' + Math.round(spanS) + ' s of ticking has been measured'); tips.push('A recording of two minutes or more narrows the range.'); }
+      if (res.sigma > 0.001) why.push('the ticks arrive unevenly (' + (res.sigma * 1000).toFixed(1) + ' ms scatter)');
+      if (!why.length) { why.push('the signal is weak'); tips.push('Move the microphone closer.'); }
       var n2 = document.createElement('span'); n2.className = 'note';
-      n2.textContent = 'The range is wide because ' + (why.join(' and ') || 'the signal is weak') + '. Move the microphone closer, or raise the high-pass filter and threshold in settings. The range narrows as more ticks arrive.';
+      n2.textContent = 'The range is wide because ' + (why.length > 1 ? why.slice(0, -1).join(', ') + ' and ' + why[why.length - 1] : why[0]) + '. ' + tips.join(' ');
       advice.appendChild(n2);
     }
     $('beat').textContent = res.beatErr == null ? '–' : (res.beatErr * 1000).toFixed(2) + ' ms';
@@ -1032,7 +1072,12 @@ canvas { width: 100%; height: 160px; display: block; }
       var ctx = new AC();
       return new Promise(function (res, rej) { ctx.decodeAudioData(buf, res, rej); }).then(function (ab) {
         try { ctx.close(); } catch (e) { /* ignore */ }
-        var ch = ab.getChannelData(0), sr = ab.sampleRate, maxN = 600 * sr;
+        var sr = ab.sampleRate, maxN = 600 * sr, ch = ab.getChannelData(0);
+        if (ab.numberOfChannels > 1) {
+          var mix = new Float32Array(ab.length), c2, j2, d2;
+          for (c2 = 0; c2 < ab.numberOfChannels; c2++) { d2 = ab.getChannelData(c2); for (j2 = 0; j2 < mix.length; j2++) mix[j2] += d2[j2] / ab.numberOfChannels; }
+          ch = mix;
+        }
         if (ch.length > maxN) ch = ch.subarray(ch.length - maxN);
         process(ch, sr, file.name + ', ' + (ch.length / sr).toFixed(0) + ' s at ' + fmtInt(sr) + ' Hz. Reading uses the last ' + S.win + ' s.');
       });
