@@ -139,12 +139,12 @@ canvas { width: 100%; height: 160px; display: block; }
       <button type="button" class="btn ghost small" id="rerunDemo">New demo clock</button>
     </div>
     <div class="panel" data-panel="file" hidden>
-      <p class="hint">Record one to two minutes with your phone's voice recorder, microphone close to the case, then load the file here.</p>
+      <p class="hint">Record two minutes or more with your phone's voice recorder, microphone close to the case, then load the file here. Files up to 20 minutes work; for a longer sample use Live mic.</p>
       <input id="file" class="sr" type="file" accept="audio/*,video/*">
       <label class="btn" for="file">Choose recording</label>
     </div>
     <div class="panel" data-panel="live" hidden>
-      <p class="hint">Listens through the microphone and updates about five times a second. Hold the phone against the clock case or stand it close by.</p>
+      <p class="hint">Listens through the microphone and updates about five times a second, with no limit on length. The screen is kept on while listening, because phones usually stop the microphone when the screen turns off. Hold the phone against the clock case or stand it close by.</p>
       <button type="button" class="btn" id="liveBtn">Start listening</button>
     </div>
     <p id="status" class="status" role="status"></p>
@@ -200,7 +200,7 @@ canvas { width: 100%; height: 160px; display: block; }
   <section class="card plot-card" aria-label="Rate history">
     <h2>Rate history</h2>
     <canvas id="cHist" role="img" aria-label="Measured rate in seconds per day over time"></canvas>
-    <p class="cap">Seconds per day against target, each point averaged over the window in settings. The shaded band is the 95% range. Watch it settle and narrow after each adjustment.</p>
+    <p class="cap">Seconds per day against target, each point averaged over the window in settings (60 s when the window is the whole recording). The shaded band is the 95% range. Watch it settle and narrow after each adjustment.</p>
   </section>
 
   <section class="card plot-card" aria-label="Sound level">
@@ -234,8 +234,9 @@ canvas { width: 100%; height: 160px; display: block; }
           <option value="30" selected>30 s</option>
           <option value="60">60 s</option>
           <option value="120">120 s</option>
+          <option value="all">Whole recording</option>
         </select>
-        <p class="hint">Longer is steadier but reacts more slowly to an adjustment.</p>
+        <p class="hint">Longer is steadier but reacts more slowly to an adjustment. Whole recording averages from the first tick to the last, which suits a long sample.</p>
       </div>
       <div class="field">
         <label class="label" for="ppm">Audio clock correction (ppm)</label>
@@ -456,8 +457,9 @@ canvas { width: 100%; height: 160px; display: block; }
 
   function tukey(z) { z = Math.abs(z); return z < 1 ? (1 - z * z) * (1 - z * z) : 0; }
 
+  var noPar = false, winCache = new WeakMap();
   function hasParity(ks) {
-    if (ks.length < 10) return false;
+    if (noPar || ks.length < 10) return false;
     var ev = 0;
     for (var i = 0; i < ks.length; i++) if (ks[i] % 2 === 0) ev++;
     return ev >= 3 && ks.length - ev >= 3;
@@ -527,12 +529,13 @@ canvas { width: 100%; height: 160px; display: block; }
       if (w[i] > 0) den += f.res[i] * f.res[i];
       if (i + 1 < n && w[i] > 0 && w[i + 1] > 0 && ks[i + 1] - ks[i] === 1) { num += f.res[i] * f.res[i + 1]; np++; }
     }
-    var rho = (np >= 8 && den > 0) ? (num / np) / (den / ninl) : 0;
-    if (rho > 2 / Math.sqrt(np || 1)) { var rr = Math.min(rho, 0.9); seT *= Math.sqrt((1 + rr) / (1 - rr)); }
+    var rho = (np >= 8 && den > 0) ? (num / np) / (den / ninl) : 0, infl = 1;
+    if (rho > 2 / Math.sqrt(np || 1)) { var rr = Math.min(rho, 0.9); infl = Math.sqrt((1 + rr) / (1 - rr)); seT *= infl; }
+    var seA = (sigma / Math.sqrt(Math.max(frac, 0.25))) * Math.sqrt(f.inv[0][0]) * infl;
     // Fixed-width fit quality, so a wrong beat guess with a huge scatter cannot win on inlier count alone
     var score = 0, tau = 0.03 * f.T;
     for (i = 0; i < n; i++) score += tukey(f.res[i] / tau);
-    return { f: f, w: w, par: par, ninl: ninl, score: score, sigma: sigma, seT: seT, ci: tMult(Math.max(1, ninl - m)) * seT };
+    return { f: f, w: w, par: par, ninl: ninl, score: score, sigma: sigma, seT: seT, seA: seA, ci: tMult(Math.max(1, ninl - m)) * seT };
   }
 
   // Re-assign every tick to its nearest beat on a fitted line, then refit. This recovers ticks that the first
@@ -626,13 +629,82 @@ canvas { width: 100%; height: 160px; display: block; }
     return null;
   }
 
+  // Average rate over a long recording. Every two minutes or so of ticks (windows overlapping by half) is fitted
+  // on its own, which the robust fitting handles even in a noisy room. Consecutive windows are then joined by
+  // counting how many beats lie between their phases; that count only goes wrong if the clock changes rate by
+  // more than a few tenths of a percent between neighbouring windows. The result is the elapsed time between
+  // the first and last window divided by the beats counted, so the scatter of individual ticks and any drift in
+  // between average out.
+  function analyzeLong(sel, Tall, tEnd, cfg) {
+    var W = 120, STEP = 60, tFirst = sel[0], tLast = sel[sel.length - 1], ends = [], e, i, j;
+    for (e = tFirst + W; e < tLast - 20; e += STEP) ends.push(e);
+    ends.push(tLast);
+    // Windows that end well before the newest tick never change again, so they are remembered. This keeps a
+    // long live session cheap, since only the newest window is fitted again each time.
+    var cache = winCache.get(Tall);
+    if (!cache) { cache = {}; winCache.set(Tall, cache); }
+    var wins = [], hint = 0;
+    for (i = 0; i < ends.length; i++) {
+      var final = ends[i] < tLast - 20, key0 = ends[i].toFixed(4), r = final ? cache[key0] : undefined;
+      if (r === undefined) { r = analyze(Tall, ends[i], W, { noParity: true, hint: hint }); if (final) cache[key0] = r; }
+      if (r.ok && r.line && r.n >= 20) { wins.push(r); hint = r.line.T; }
+    }
+    if (wins.length < 2) return null;
+
+    var K = [wins[0].line.kb], worst = 0, offs = [0];
+    for (i = 1; i < wins.length; i++) {
+      var p = wins[i - 1].line, q = wins[i].line, Tm = 0.5 * (p.T + q.T);
+      var u = (q.P - p.P) / Tm, frac = q.kb - p.kb, extra = Math.round(u - frac);
+      worst = Math.max(worst, Math.abs(u - frac - extra));
+      K.push(K[i - 1] + frac + extra);
+      offs.push(K[i] - q.kb);
+    }
+    if (worst > 0.4) return null;                       // beat count is ambiguous: fall back to the recent window
+
+    var first = wins[0].line, last = wins[wins.length - 1].line;
+    var dK = K[K.length - 1] - K[0], Tm = (last.P - first.P) / dK;
+    if (!(Tm > 0) || !(dK > 20)) return null;
+    var wf = wins[0], wl = wins[wins.length - 1];
+    // The phase at each end is uncertain by at least the tick scatter, because slow timing drift is not averaged away
+    var se1 = Math.max(first.seA, wf.sigma), se2 = Math.max(last.seA, wl.sigma);
+    var seT = Math.sqrt(se1 * se1 + se2 * se2) / dK;
+    var ci = tMult(Math.max(1, wf.n + wl.n - 6)) * seT;
+
+    // Beat error and scatter from the most recent window, fitted with the even/odd offset this time
+    var rec = analyze(Tall, tLast, W, {});
+    // Ticks with whole-recording beat numbers, for the timing trace
+    var seen = {}, tsA = [], ksA = [], wA = [], bad = 0, cnt = 0;
+    for (i = 0; i < wins.length; i++) {
+      var wi = wins[i];
+      for (j = 0; j < wi.ts.length; j++) {
+        var key = wi.ts[j].toFixed(6);
+        if (seen[key] === undefined) { seen[key] = tsA.length; tsA.push(wi.ts[j]); ksA.push(wi.ks[j] + Math.round(offs[i])); wA.push(wi.w[j] > 0 ? 1 : 0); }
+      }
+    }
+    for (j = 0; j < wA.length; j++) { if (wA[j]) cnt++; else bad++; }
+    var scale = 1 + (cfg.ppm || 0) * 1e-6, ciSday = 86400 * ci / Tm, frac2 = cnt / sel.length;
+    return {
+      ok: true, long: true, n: cnt, nRaw: sel.length, dropped: Math.max(0, sel.length - tsA.length), outliers: bad, gaps: 0,
+      T: Tm * scale, seT: seT * scale, ci: ci * scale, ciSday: ciSday,
+      confidence: (ciSday <= 1 && frac2 >= 0.6) ? 'high' : (ciSday <= 5 && frac2 >= 0.4) ? 'medium' : 'low',
+      beatErr: rec.ok ? rec.beatErr : null,
+      sigma: rec.ok ? rec.sigma : 0.5 * (wf.sigma + wl.sigma),
+      ts: tsA, ks: ksA, w: wA, res: [], windows: wins.length, spanSec: tLast - tFirst
+    };
+  }
+
   function analyze(T, tEnd, win, cfg) {
     cfg = cfg || {};
+    noPar = !!cfg.noParity;
     var lo = 0, hi = T.length, i;
     while (lo < hi) { var mid = (lo + hi) >> 1; if (T[mid] < tEnd - win) lo = mid + 1; else hi = mid; }
     var sel = [];
     for (i = lo; i < T.length && T[i] <= tEnd; i++) sel.push(T[i]);
     if (sel.length < 6) return { ok: false, n: sel.length, reason: 'few' };
+    if (win > 150 && sel[sel.length - 1] - sel[0] > 150) {
+      var LR = analyzeLong(sel, T, tEnd, cfg);
+      if (LR) return LR;
+    }
 
     var d = [];
     for (i = 1; i < sel.length; i++) d.push(sel[i] - sel[i - 1]);
@@ -643,15 +715,27 @@ canvas { width: 100%; height: 160px; display: block; }
     var T0 = pair.length >= 4 ? median(pair) : m;
     var cands = [T0];
     if (Math.abs(m / T0 - 1) > 0.03) cands.push(m);
+    if (cfg.hint) cands.push(cfg.hint);   // a beat interval already known from a neighbouring stretch of the recording
 
     var best = null;
     for (i = 0; i < cands.length; i++) {
       var s = solveFor(sel, cands[i]);
       if (s && (!best || s.rf.score > best.rf.score)) best = s;
     }
+    // With a beat interval known from a neighbouring stretch, pick ticks by their phase at that interval.
+    // This stays reliable when stray sounds break the interval-following above, and costs almost nothing.
+    if (cfg.hint) {
+      var C = 0, Sn = 0;
+      for (i = 0; i < sel.length; i++) { var ph0 = 2 * Math.PI * sel[i] / cfg.hint; C += Math.cos(ph0); Sn += Math.sin(ph0); }
+      if (Math.sqrt(C * C + Sn * Sn) >= 0.15 * sel.length) {
+        var th = Math.atan2(Sn, C); if (th < 0) th += 2 * Math.PI;
+        var sp0 = solveFromPrior(sel, cfg.hint, th * cfg.hint / (2 * Math.PI));
+        if (sp0 && (!best || sp0.rf.score > best.rf.score)) best = sp0;
+      }
+    }
     // When many events were rejected, the interval guess was probably spoiled by stray sounds.
     // Look for the beat by phase coherence instead and keep whichever explanation uses more ticks.
-    if (!best || best.rf.ninl < 0.6 * sel.length || best.rf.sigma > 0.01 * best.rf.f.T) {
+    if (!best || (!(cfg.hint && best.rf.ninl >= 0.3 * sel.length) && (best.rf.ninl < 0.6 * sel.length || (best.rf.sigma > 0.01 * best.rf.f.T && best.rf.ninl < 0.85 * sel.length)))) {
       var pg = periodogramCandidate(sel);
       if (pg) {
         var sp = solveFromPrior(sel, pg.T, pg.tRef);
@@ -675,15 +759,17 @@ canvas { width: 100%; height: 160px; display: block; }
       confidence: conf,
       beatErr: rf.par ? Math.abs(f.c) * scale : null,
       sigma: rf.sigma,
+      line: { P: f.t0 + f.a, kb: f.kb, T: f.T, seA: rf.seA },
       ts: best.ts, ks: best.ks, w: rf.w, res: f.res
     };
   }
 
-  function snapBph(T) {
-    var bph = 3600 / T, best = STANDARD_BPH[0], bd = Infinity;
-    for (var i = 0; i < STANDARD_BPH.length; i++) {
-      var dd = Math.abs(Math.log(bph / STANDARD_BPH[i]));
-      if (dd < bd) { bd = dd; best = STANDARD_BPH[i]; }
+  function snapBph(T, extra) {
+    var list = STANDARD_BPH.concat(extra || []);
+    var bph = 3600 / T, best = list[0], bd = Infinity;
+    for (var i = 0; i < list.length; i++) {
+      var dd = Math.abs(Math.log(bph / list[i]));
+      if (dd < bd) { bd = dd; best = list[i]; }
     }
     return { bph: best, offset: bph / best - 1 };
   }
@@ -761,7 +847,7 @@ canvas { width: 100%; height: 160px; display: block; }
   var S = {
     mode: 'demo', sr: 48000, samples: null, det: null, label: '',
     win: 30, ppm: 0, sens: 8, hp: 2000, refBph: 3600, target: 'auto',
-    hist: [], result: null, live: null, timer: null, liveEvery: 200, customBph: 10000, liveHistT: -1, demoMeta: null
+    hist: [], result: null, live: null, timer: null, liveEvery: 200, wake: null, wakeHooked: false, customBph: 10000, liveHistT: -1, demoMeta: null
   };
 
   /* ---------- small helpers ---------- */
@@ -771,6 +857,16 @@ canvas { width: 100%; height: 160px; display: block; }
     if (Math.abs(x) < lim) x = 0;
     return (x > 0 ? '+' : '') + x.toFixed(d).replace('-', '−');
   }
+  var PRESETS = [{ bph: 10062, name: 'My clock, 167.700 beats/min', kind: 'pendulum' }];
+  function presetBphs() { return PRESETS.map(function (p) { return p.bph; }); }
+  function presetFor(bph) { for (var i = 0; i < PRESETS.length; i++) if (PRESETS[i].bph === bph) return PRESETS[i]; return null; }
+  function regText(dir, bph) {
+    var p = presetFor(bph), faster = dir === 'faster';
+    if (p && p.kind === 'pendulum') return faster ? 'Raise the pendulum bob a little (turn the rating nut under it) to speed it up' : 'Lower the pendulum bob a little (turn the rating nut under it) to slow it down';
+    if (TG.STANDARD_BPH.indexOf(bph) >= 0) return faster ? 'Move the regulator lever toward F, + or A (advance) to speed it up' : 'Move the regulator lever toward S, \u2212 or R (retard) to slow it down';
+    return faster ? 'Speed it up with the regulator: raise a pendulum bob, or move a balance lever toward F, + or A (advance)' : 'Slow it down with the regulator: lower a pendulum bob, or move a balance lever toward S, \u2212 or R (retard)';
+  }
+  function winSec() { return S.win === 'all' ? 1e9 : S.win; }
   function rateOf(T, bph) { return 86400 * ((3600 / bph) / T - 1); }
   function setStatus(msg, kind) { var s = $('status'); s.textContent = msg; s.dataset.kind = kind || ''; }
   function hzText(bph) { return (bph / 7200).toFixed(3) + ' Hz'; }
@@ -781,7 +877,7 @@ canvas { width: 100%; height: 160px; display: block; }
       if (typeof j.ppm === 'number') S.ppm = j.ppm;
       if (j.v === 2 && typeof j.sens === 'number') S.sens = j.sens; // older saves held the previous default of 4
       if (typeof j.hp === 'number') S.hp = j.hp;
-      if (typeof j.win === 'number') S.win = j.win;
+      if (j.win === 'all' || typeof j.win === 'number') S.win = j.win;
       if (typeof j.refBph === 'number') S.refBph = j.refBph;
       if (typeof j.customBph === 'number' && j.customBph > 0) S.customBph = j.customBph;
     } catch (e) { /* storage unavailable */ }
@@ -793,9 +889,10 @@ canvas { width: 100%; height: 160px; display: block; }
   /* ---------- analysis and readout ---------- */
   function pickBph(res) {
     if (S.target === 'custom') return S.customBph > 0 ? S.customBph : null;
+    if (S.target.indexOf('preset:') === 0) return +S.target.slice(7);
     if (S.target !== 'auto') return +S.target;
     if (!res || !res.ok) return null;
-    var sn = TG.snapBph(res.T);
+    var sn = TG.snapBph(res.T, presetBphs());
     return Math.abs(sn.offset) <= 0.03 ? sn.bph : null;   // a standard more than 3% away is not a match
   }
 
@@ -865,17 +962,22 @@ canvas { width: 100%; height: 160px; display: block; }
       advice.textContent = 'The reading is ' + signed(rate, 1) + ' s/day, but its 95% range of ±' + ciTxt + ' s/day includes zero, so the direction is not clear yet. Keep listening or improve the signal before touching the regulator.';
     } else if (rate < 0) {
       pill.textContent = 'Running slow'; pill.dataset.state = 'off';
-      advice.textContent = rough + 'Loses ' + Math.abs(rate).toFixed(1) + ' s/day (' + span + ' at 95%, ' + ppm.toFixed(0) + ' ppm). Move the regulator lever toward F, + or A (advance) to speed it up, then wait for the reading to settle.';
+      advice.textContent = rough + 'Loses ' + Math.abs(rate).toFixed(1) + ' s/day (' + span + ' at 95%, ' + ppm.toFixed(0) + ' ppm). ' + regText('faster', bph) + ', then wait for the reading to settle.';
     } else {
       pill.textContent = 'Running fast'; pill.dataset.state = 'off';
-      advice.textContent = rough + 'Gains ' + rate.toFixed(1) + ' s/day (' + span + ' at 95%, ' + ppm.toFixed(0) + ' ppm). Move the regulator lever toward S, − or R (retard) to slow it down, then wait for the reading to settle.';
+      advice.textContent = rough + 'Gains ' + rate.toFixed(1) + ' s/day (' + span + ' at 95%, ' + ppm.toFixed(0) + ' ppm). ' + regText('slower', bph) + ', then wait for the reading to settle.';
     }
     if (res.beatErr != null && res.beatErr * 1000 >= 1.0) {
       var n = document.createElement('span'); n.className = 'note';
       n.textContent = 'Beat error is high (' + (res.beatErr * 1000).toFixed(2) + ' ms), so the clock is out of beat. Setting the beat first usually gives a steadier rate to regulate.';
       advice.appendChild(n);
     }
-    if (res.confidence !== 'high') {
+    if (res.confidence === 'medium') {
+      var n3 = document.createElement('span'); n3.className = 'note';
+      n3.textContent = 'To narrow the \u00b1' + ciTxt + ' s/day range, measure for longer.';
+      advice.appendChild(n3);
+    }
+    if (res.confidence === 'low') {
       var why = [], tips = [], spanS = res.ts[res.ts.length - 1] - res.ts[0];
       if (res.n < 0.6 * res.nRaw) { why.push('many sounds are being treated as strays'); tips.push('Move the microphone closer or raise the threshold in settings.'); }
       if (spanS < 60) { why.push('only ' + Math.round(spanS) + ' s of ticking has been measured'); tips.push('A recording of two minutes or more narrows the range.'); }
@@ -894,7 +996,7 @@ canvas { width: 100%; height: 160px; display: block; }
   function render() {
     var det = S.det;
     if (!det) { clearReadout(); drawAll(null, null); return; }
-    var res = TG.analyze(det.ticks, det.now(), S.win, { ppm: S.ppm });
+    var res = TG.analyze(det.ticks, det.now(), winSec(), { ppm: S.ppm });
     S.result = res;
     var bph = null;
     if (res.ok) { showResult(res); bph = pickBph(res); } else showNoResult(res);
@@ -905,11 +1007,11 @@ canvas { width: 100%; height: 160px; display: block; }
     S.hist = [];
     var det = S.det; if (!det) return;
     var end = det.now();
-    var res = TG.analyze(det.ticks, end, S.win, { ppm: S.ppm });
+    var res = TG.analyze(det.ticks, end, winSec(), { ppm: S.ppm });
     var bph = pickBph(res); if (!bph) return;
-    var step = Math.max(2, end / 60);
+    var step = Math.max(2, end / 60), hw = S.win === 'all' ? 60 : S.win;   // history shows drift, so it uses short windows
     for (var t = Math.min(10, end); t <= end + 1e-9; t += step) {
-      var r = TG.analyze(det.ticks, t, S.win, { ppm: S.ppm });
+      var r = TG.analyze(det.ticks, t, hw, { ppm: S.ppm });
       if (r.ok) S.hist.push({ t: t, rate: rateOf(r.T, bph), ci: r.ciSday });
     }
   }
@@ -1097,24 +1199,41 @@ canvas { width: 100%; height: 160px; display: block; }
     if (!AC) { setStatus('This browser cannot decode audio.', 'error'); return; }
     setStatus('Decoding ' + file.name + '...');
     file.arrayBuffer().then(function (buf) {
-      var ctx = new AC();
+      var ctx;
+      try { ctx = new AC({ sampleRate: 24000 }); } catch (e) { ctx = new AC(); }   // ticks sit well below 12 kHz, and this halves the memory used
       return new Promise(function (res, rej) { ctx.decodeAudioData(buf, res, rej); }).then(function (ab) {
         try { ctx.close(); } catch (e) { /* ignore */ }
-        var sr = ab.sampleRate, maxN = 600 * sr, ch = ab.getChannelData(0);
+        var sr = ab.sampleRate, maxN = 1200 * sr, ch = ab.getChannelData(0), fullSec = ab.length / sr;
         if (ab.numberOfChannels > 1) {
           var mix = new Float32Array(ab.length), c2, j2, d2;
           for (c2 = 0; c2 < ab.numberOfChannels; c2++) { d2 = ab.getChannelData(c2); for (j2 = 0; j2 < mix.length; j2++) mix[j2] += d2[j2] / ab.numberOfChannels; }
           ch = mix;
         }
-        if (ch.length > maxN) ch = ch.subarray(ch.length - maxN);
-        process(ch, sr, file.name + ', ' + (ch.length / sr).toFixed(0) + ' s at ' + fmtInt(sr) + ' Hz. Reading uses the last ' + S.win + ' s.');
+        var trimmed = ch.length > maxN;
+        if (trimmed) ch = ch.subarray(ch.length - maxN);
+        process(ch, sr, file.name + ', ' + (ch.length / sr).toFixed(0) + ' s at ' + fmtInt(sr) + ' Hz. ' +
+          (trimmed ? 'Only the last 20 minutes of this ' + Math.round(fullSec / 60) + ' minute file were used. ' : '') +
+          (S.win === 'all' ? 'Reading averages the whole recording.' : 'Reading uses the last ' + S.win + ' s.'));
       });
     }).catch(function () {
-      setStatus('That file could not be decoded. Try a WAV, M4A or MP3 recording.', 'error');
+      setStatus('That file could not be decoded. Try a WAV, M4A or MP3 recording. Very long files can run out of memory, so try a shorter one or use Live mic.', 'error');
     });
   }
 
+  function acquireWake() {
+    try {
+      if (navigator.wakeLock && navigator.wakeLock.request) {
+        navigator.wakeLock.request('screen').then(function (l) {
+          S.wake = l;
+          if (l.addEventListener) l.addEventListener('release', function () { if (S.wake === l) S.wake = null; });
+        }).catch(function () { /* not allowed here: the page still works */ });
+      }
+    } catch (e) { /* ignore */ }
+  }
+  function releaseWake() { try { if (S.wake) S.wake.release(); } catch (e) { /* ignore */ } S.wake = null; }
+
   function stopLive() {
+    releaseWake();
     if (S.timer) { clearInterval(S.timer); S.timer = null; }
     var L = S.live; S.live = null;
     if (L) {
@@ -1134,8 +1253,8 @@ canvas { width: 100%; height: 160px; display: block; }
     }
     var t = det.now();
     if (S.result && S.result.ok && t - S.liveHistT >= 2) {
-      var bph = pickBph(S.result);
-      S.hist.push({ t: t, rate: rateOf(S.result.T, bph), ci: S.result.ciSday });
+      var bph = pickBph(S.result), hr = S.win === 'all' ? TG.analyze(det.ticks, t, 60, { ppm: S.ppm }) : S.result;
+      if (bph && hr.ok) S.hist.push({ t: t, rate: rateOf(hr.T, bph), ci: hr.ciSday });
       if (S.hist.length > 600) S.hist.shift();
       S.liveHistT = t;
       drawHist();
@@ -1162,6 +1281,11 @@ canvas { width: 100%; height: 160px; display: block; }
       src.connect(proc); proc.connect(ctx.destination);
       S.live = { ctx: ctx, stream: stream, src: src, proc: proc };
       $('liveBtn').textContent = 'Stop listening';
+      acquireWake();
+      if (!S.wakeHooked && document.addEventListener) {
+        S.wakeHooked = true;
+        document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'visible' && S.live && !S.wake) acquireWake(); });
+      }
       S.liveEvery = 200; S.timer = setInterval(liveTick, S.liveEvery);
       setStatus('Listening...');
     }).catch(function () { micBlocked(); });
@@ -1201,6 +1325,10 @@ canvas { width: 100%; height: 160px; display: block; }
       var op = document.createElement('option');
       op.value = String(b); op.textContent = fmtInt(b) + ' bph (' + (b / 7200) + ' Hz)'; sel.appendChild(op);
     });
+    PRESETS.forEach(function (p) {
+      var op = document.createElement('option');
+      op.value = 'preset:' + p.bph; op.textContent = p.name + ' (' + fmtInt(p.bph) + ' bph)'; sel.appendChild(op);
+    });
     var oc = document.createElement('option'); oc.value = 'custom'; oc.textContent = 'Custom...'; sel.appendChild(oc);
     $('customBph').value = S.customBph;
     $('sens').value = S.sens; $('sensVal').textContent = S.sens;
@@ -1223,7 +1351,7 @@ canvas { width: 100%; height: 160px; display: block; }
     });
     $('sens').addEventListener('input', function (e) { S.sens = +e.target.value; $('sensVal').textContent = S.sens; save(); reprocessSoon(); });
     $('hp').addEventListener('change', function (e) { S.hp = +e.target.value; save(); reprocessSoon(); });
-    $('win').addEventListener('change', function (e) { S.win = +e.target.value; save(); rerender(); });
+    $('win').addEventListener('change', function (e) { S.win = e.target.value === 'all' ? 'all' : +e.target.value; save(); rerender(); });
     $('ppm').addEventListener('change', function (e) { var v = parseFloat(e.target.value); S.ppm = isFinite(v) ? v : 0; save(); rerender(); });
     $('refBph').addEventListener('change', function (e) { var v = parseFloat(e.target.value); if (isFinite(v) && v > 0) S.refBph = v; save(); });
     $('calBtn').addEventListener('click', function () {
